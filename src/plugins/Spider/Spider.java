@@ -645,7 +645,7 @@ public class Spider implements FredPlugin, FredPluginThreadless,
 				pageCallBack.finish();
 				page.setStatus(Status.NOT_PUSHED);
 				page.setLastFetched();
-				librarybuffer.maybeSend();
+				librarybuffer.alwaysWrite();
 
 			} catch (UnsafeContentTypeException e) {
 				// wrong mime type

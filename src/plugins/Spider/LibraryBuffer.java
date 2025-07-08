@@ -2,18 +2,20 @@
 package plugins.Spider;
 
 import freenet.keys.FreenetURI;
-import freenet.pluginmanager.FredPluginTalker;
-import freenet.pluginmanager.PluginNotFoundException;
 import freenet.pluginmanager.PluginRespirator;
-import freenet.pluginmanager.PluginTalker;
 import freenet.support.Logger;
 import freenet.support.SimpleFieldSet;
 import freenet.support.api.Bucket;
-import freenet.support.io.FileBucket;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.MalformedURLException;
 import java.util.Collection;
 import java.util.TreeMap;
@@ -30,7 +32,7 @@ import plugins.Spider.org.garret.perst.Storage;
  *
  * @author MikeB
  */
-public class LibraryBuffer implements FredPluginTalker {
+public class LibraryBuffer {
 	private PluginRespirator pr;
 	private long timeStalled = 0;
 	private long timeNotStalled = 0;
@@ -56,26 +58,21 @@ public class LibraryBuffer implements FredPluginTalker {
 		bufferMax = maxSize;
 	}
 
-	/** We only consider sending the data after a file has been parsed, not mid way through. */
-	public void maybeSend() {
-		boolean push = false;
+	/** We always write after a file has been successfully processed. */
+	public void alwaysWrite() {
 		int bufferUsageEstimated = 0;
 		synchronized(this) {
-			if (bufferMax == 0) return;
-			if (bufferUsageEstimate > bufferMax) {
-				if(pushing != null) {
-					throw new IllegalStateException("Still pushing?!");
-				}
-				pushing = termPageBuffer.values();
-				push = true;
-				termPageBuffer = new TreeMap();
-				bufferUsageEstimated = bufferUsageEstimate;
-				bufferUsageEstimate = 0;
+			if(pushing != null) {
+				throw new IllegalStateException("Still pushing?!");
 			}
+			pushing = termPageBuffer.values();
+			termPageBuffer = new TreeMap();
+			bufferUsageEstimated = bufferUsageEstimate;
+			bufferUsageEstimate = 0;
+			writeFile(bufferUsageEstimated);
 		}
-		if(push) sendBuffer(bufferUsageEstimated);
 	}
-	
+
 	/**
 	 * Increments the estimate by specified amount.
 	 * @param increment
@@ -157,14 +154,18 @@ public class LibraryBuffer implements FredPluginTalker {
 	 *
 	 * FIXME : I think there is something wrong with the way it writes to the bucket, I may be using the wrong kind of buffer
 	 */
-	private void sendBuffer(int bufferUsageEstimated) {
+	private void writeFile(int bufferUsageEstimated) {
 		long tStart = System.currentTimeMillis();
 		try {
-			Logger.normal(this, "Sending buffer of estimated size " + bufferUsageEstimated + " bytes to Library");
-			Bucket bucket = pr.getNode().clientCore.tempBucketFactory.makeBucket(3000000);
-			writeToPush(totalPagesIndexed(), bucket);
-			innerSend(bucket);
-			Logger.normal(this, "Buffer successfully sent to Library, size = "+bucket.size());
+			int fileNumber = 0;
+			File file;
+			do {
+				file = new File(".", "spider.index.data." + ++fileNumber);
+			} while (file.exists());
+			Logger.normal(this, "Writing file of estimated size " + bufferUsageEstimated + " bytes to Library in file " + file);
+			OutputStream os = new FileOutputStream(file);
+			writeToPush(totalPagesIndexed(), os);
+			Logger.normal(this, "File successfully written to Library");
 			// Not a separate transaction, commit with the index updates.
 			spider.donePages();
 		} catch (IOException ex) {
@@ -177,13 +178,6 @@ public class LibraryBuffer implements FredPluginTalker {
 			timeStalled += (tEnd - tStart);
 			if(shutdown) return;
 		}
-		// Robustness: Send SAVE_FILE *after* sending new data, because *it is already on disk*, whereas the new data is not.
-		if(SAVE_FILE.exists()) {
-			System.out.println("Restoring data from last time from "+SAVE_FILE);
-			Bucket bucket = new FileBucket(SAVE_FILE, true, false, false, true);
-			innerSend(bucket);
-			System.out.println("Restored data from last time from "+SAVE_FILE);
-		}
 	}
 
 	private long totalPagesIndexed() {
@@ -192,8 +186,7 @@ public class LibraryBuffer implements FredPluginTalker {
 				+ spider.getRoot().getPageCount(Status.PROCESSED_USK);
 	}
 	
-	private synchronized Bucket writeToPush(long totalPagesIndexed, Bucket bucket) throws IOException {
-		OutputStream os = bucket.getOutputStream();
+	private synchronized void writeToPush(long totalPagesIndexed, OutputStream os) throws IOException {
 		SimpleFieldSet meta = new SimpleFieldSet(true); // Stored with data to make things easier.
 		String indexTitle = spider.getConfig().getIndexTitle();
 		String indexOwner = spider.getConfig().getIndexOwner();
@@ -211,54 +204,14 @@ public class LibraryBuffer implements FredPluginTalker {
 		}
 		pushing = null;
 		os.close();
-		bucket.setReadOnly();
-		return bucket;
 	}
 
-	private void innerSend(Bucket bucket) {
-		SimpleFieldSet sfs = new SimpleFieldSet(true);
-		sfs.putSingle("command", "pushBuffer");
-		PluginTalker libraryTalker;
-		try {
-			libraryTalker = pr.getPluginTalker(this, "plugins.Library.Main", "SpiderBuffer");
-			libraryTalker.sendSyncInternalOnly(sfs, bucket);
-			bucket.free();
-		} catch (PluginNotFoundException e) {
-			Logger.error(this, "Couldn't connect buffer to Library", e);
-		}
-
-	}
-	
 	public long getTimeStalled() {
 		return timeStalled;
 	}
 	
 	public long getTimeNotStalled() {
 		return timeNotStalled;
-	}
-
-	public void onReply(String pluginname, String indentifier, SimpleFieldSet params, Bucket data) {
-		String reply = params.get("reply");
-		if("getSpiderURI".equals(reply)) {
-			String s = params.get("publicUSK");
-			if(s != null) {
-				try {
-					FreenetURI uri = new FreenetURI(s);
-					synchronized(this) {
-						lastURI = uri;
-						notifyAll();
-					}
-					return;
-				} catch (MalformedURLException e) {
-					Logger.error(this, "Got bogus URI: "+s, new Exception("error"));
-				}
-			}
-			synchronized(this) {
-				badURI = true;
-				notifyAll();
-			}
-		}
-		Logger.error(this, "Ignoring message "+reply);
 	}
 
 	public void terminate() {
@@ -272,46 +225,53 @@ public class LibraryBuffer implements FredPluginTalker {
 			termPageBuffer = new TreeMap();
 			bufferUsageEstimate = 0;
 		}
-		System.out.println("Writing pending data to "+SAVE_FILE);
-		FileBucket bucket = new FileBucket(SAVE_FILE, false, false, false, false);
-		long totalPagesIndexed;
+	}
+
+	/** Reads the (first) line from a file and returns as a String.
+	 * If there is a problem null is returned.
+	 */
+	static String readFileLine(final String filename) {
+		File f = new File(filename);
+		FileInputStream fis;
 		try {
-			totalPagesIndexed = totalPagesIndexed();
-		} catch (Throwable t) {
-			totalPagesIndexed = -1;
-			// FIXME I don't understand why this (ClassNotFoundException) happens, we have not closed the class loader yet.
-			System.err.println("Failed to determine page size during writing data to "+SAVE_FILE+": "+t);
-			t.printStackTrace();
+			fis = new FileInputStream(f);
+		} catch (FileNotFoundException e) {
+			return null;
 		}
+		BufferedReader br = null;
+		String line;
 		try {
-			writeToPush(totalPagesIndexed, bucket);
+			br = new BufferedReader(new InputStreamReader(fis, "UTF-8"));
+			line = br.readLine();
+		} catch (UnsupportedEncodingException e) {
+			return null;
 		} catch (IOException e) {
-			System.err.println("Failed to write pending data: "+e); // Hopefully no data loss due to NOT_PUSHED vs INDEXED.
-			e.printStackTrace();
+			return null;
+		} finally {
+			try {
+				if (br != null) {
+					br.close();
+				}
+			} catch (IOException e) {
+				// Ignore the problem.
+			}
 		}
-		System.out.println("Written pending data to "+SAVE_FILE);
+		return line;
 	}
 
 	public FreenetURI getURI() {
-		SimpleFieldSet sfs = new SimpleFieldSet(true);
-		sfs.putSingle("command", "getSpiderURI");
-		PluginTalker libraryTalker;
-		try {
-			libraryTalker = pr.getPluginTalker(this, "plugins.Library.Main", "SpiderBuffer.getURI");
-			libraryTalker.sendSyncInternalOnly(sfs, null);
-		} catch (PluginNotFoundException e) {
-			Logger.error(this, "Couldn't connect buffer to Library", e);
-		}
-		synchronized(this) {
-			if(lastURI == null) {
-				if(badURI) return null;
-				try {
-					wait(1000);
-				} catch (InterruptedException e) {
-					// Ignore.
-				}
+		String ssk = readFileLine("library.index.pubkey");
+		String edition = readFileLine("library.index.last-edition");
+		if (ssk != null && edition != null) {
+			String keyPart = ssk.substring("freenet:SSK@".length());
+
+			try {
+				return new FreenetURI("USK@" + keyPart + "/" + edition);
+			} catch (MalformedURLException e) {
+				return null;
 			}
-			return lastURI;
+		} else {
+			return null;
 		}
 	}
 	
