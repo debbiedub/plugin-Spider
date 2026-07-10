@@ -130,12 +130,15 @@ async def download() -> None:
 
 
 async def main() -> None:
-    async def state_controller() -> None:
+    def state_controller_print_help() -> None:
         print('Running states are:')
         print('* RUN (r)')
         print('* START_SHUTDOWN (n) - will shutdown after new USK is uploaded')
         print('* SHUTDOWN (s)')
         print('Pressing return moves to the next state.')
+
+    async def state_controller() -> None:
+        state_controller_print_help()
         global state
         while True:
             c = await asyncio.to_thread(input)
@@ -152,6 +155,8 @@ async def main() -> None:
             elif c == '' and state == SHUTDOWN:
                 print('Is SHUTDOWN')
                 break
+            elif c == 'h' or c == '?':
+                state_controller_print_help()
             elif c != '':
                 print('Unknown command', c)
 
