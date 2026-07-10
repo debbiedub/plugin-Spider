@@ -66,19 +66,23 @@ async def upload() -> None:
     while state != SHUTDOWN:
         print('Starting Upload')
         params = []
+        uploading = os.path.exists('library-temp-index-1')
         if state == START_SHUTDOWN:
             print('Upload will be started forcing creation of USK')
             params.append("--force-create-usk")
-            if os.path.exists('library-temp-index-1'):
+            if uploading:
                 state = SHUTDOWN
         await shell('upload',
                     'exec nice java ' +
                     '-jar ../git/plugin-Library/dist/uploader.jar ' +
                     f'{" ".join(params)}')
-        if not os.path.exists('library-temp-index-1'):
-            await asyncio.sleep(30)
-        else:
+        upload_not_completed = os.path.exists('library-temp-index-1')
+        if uploading and upload_not_completed:
+            print('Upload did not complete.')
+        if upload_not_completed:
             await asyncio.sleep(10)
+        else:
+            await asyncio.sleep(30)
     print('No more uploads started')
 
 
