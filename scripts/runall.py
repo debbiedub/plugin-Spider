@@ -43,6 +43,7 @@ async def shell(header: str, command: str) -> None:
     await proc.communicate()
 
 
+RESTART = object()
 RUN = object()
 START_SHUTDOWN = object()
 SHUTDOWN = object()
@@ -51,11 +52,21 @@ state = RUN
 
 
 async def restart_node() -> None:
-    while state != SHUTDOWN:
+    global state
+    restarted = False
+    while state is not SHUTDOWN:
         await shell('node', './run.sh start')
+        if restarted:
+            await asyncio.sleep(100)
+            state = RUN
         for i in range(3 * 3600):
             await asyncio.sleep(1)
-            if not state != SHUTDOWN:
+            if state is SHUTDOWN:
+                break
+            if not restarted and state is RESTART:
+                await shell('restart', './run.sh stop')
+                await asyncio.sleep(10)
+                restarted = True
                 break
     print('No more restarts of node')
 
@@ -63,11 +74,12 @@ async def restart_node() -> None:
 async def upload() -> None:
     global state
     await asyncio.sleep(10)
-    while state != SHUTDOWN:
+    failed_attempts = 0
+    while state is not SHUTDOWN:
         print('Starting Upload')
         params = []
         uploading = os.path.exists('library-temp-index-1')
-        if state == START_SHUTDOWN:
+        if state is START_SHUTDOWN:
             print('Upload will be started forcing creation of USK')
             params.append("--force-create-usk")
             if uploading:
@@ -77,8 +89,19 @@ async def upload() -> None:
                     '-jar ../git/plugin-Library/dist/uploader.jar ' +
                     f'{" ".join(params)}')
         upload_not_completed = os.path.exists('library-temp-index-1')
-        if uploading and upload_not_completed:
-            print('Upload did not complete.')
+        if uploading:
+            if upload_not_completed:
+                print('Upload did not complete.')
+                failed_attempts += 1
+                if failed_attempts > 10:
+                    state = RESTART
+                    failed_attempts //= 2
+                    for i in range(1000):
+                        await asyncio.sleep(1)
+                        if state is not RESTART:
+                            break
+            else:
+                failed_attempts //= 2
         if upload_not_completed:
             await asyncio.sleep(10)
         else:
@@ -88,7 +111,7 @@ async def upload() -> None:
 
 async def download() -> None:
     await asyncio.sleep(30)
-    while state == RUN:
+    while state is RUN:
         print('Starting DownloadOneEdition')
         pubkey = open('library.index.pubkey').read()
         assert pubkey.startswith('freenet:SSK')
@@ -104,7 +127,7 @@ async def download() -> None:
                     'exec nice -18 java ' +
                     '-cp ../git/plugin-Library/dist/uploader.jar ' +
                     f'{" ".join(params)}')
-        if state == RUN:
+        if state is RUN:
             # Check if there are deletions left in the processed files
             async with asyncio.TaskGroup() as tg:
                 print('Checking for deletions left')
@@ -128,7 +151,7 @@ async def download() -> None:
                 print('Deletions left')
         for i in range(1000):
             await asyncio.sleep(1)
-            if not state != SHUTDOWN:
+            if state is SHUTDOWN:
                 break
     print('No more downloads started')
 
@@ -149,14 +172,14 @@ async def main() -> None:
             if c == 'r':
                 print('Entering RUN')
                 state = RUN
-            elif c == 'n' or (c == '' and state == RUN):
+            elif c == 'n' or (c == '' and state is RUN):
                 print('Entering START_SHUTDOWN')
                 state = START_SHUTDOWN
-            elif c == 's' or (c == '' and state == START_SHUTDOWN):
+            elif c == 's' or (c == '' and state is START_SHUTDOWN):
                 print('Entering SHUTDOWN')
                 state = SHUTDOWN
                 break
-            elif c == '' and state == SHUTDOWN:
+            elif c == '' and state is SHUTDOWN:
                 print('Is SHUTDOWN')
                 break
             elif c == 'h' or c == '?':
