@@ -75,7 +75,39 @@ async def upload() -> None:
     global state
     await asyncio.sleep(10)
     failed_attempts = 0
+    rotated_recently = False
     while state is not SHUTDOWN:
+        if datetime.datetime.now().day == 15:
+            if not rotated_recently:
+                # Rotate every month on the 15th
+                print('Start rotating.')
+                DIR_NAME = 'library-spider-pushed-data-cache'
+                OLD_DIR_NAME = f'{DIR_NAME}.old'
+                if os.path.exists(OLD_DIR_NAME):
+                    counter = 1
+                    while os.path.exists(new_dir_name := f'library-spider-pushed-data-cache.old{counter}'):
+                        counter += 1
+                    print(f'Move {OLD_DIR_NAME} into {new_dir_name}')
+                    os.rename(OLD_DIR_NAME, new_dir_name)
+                NEW_DIR_NAME = f'{DIR_NAME}.new'
+                if os.path.exists(NEW_DIR_NAME):
+                    print(f'Remove the {NEW_DIR_NAME} that is in the way')
+                    for file in os.scandir(NEW_DIR_NAME):
+                        os.remove(file)
+                    os.rmdir(NEW_DIR_NAME)
+                await shell('rotate',
+                            f'cd {DIR_NAME} && ' +
+                            'java -cp ../../git/plugin-Library/dist/uploader.jar freenet.library.uploader.MoveUsedPartsOfIndex `cat ../library.index.lastpushed.chk`')
+                print(f'Rename {DIR_NAME}, {OLD_DIR_NAME}')
+                os.rename(DIR_NAME, OLD_DIR_NAME)
+                print(f'Rename {NEW_DIR_NAME}, {DIR_NAME}')
+                os.rename(NEW_DIR_NAME, DIR_NAME)
+                await shell('calculate size',
+                            f'( du {DIR_NAME}; ls {DIR_NAME} | wc -l ) > {DIR_NAME}.size')
+                print('Done rotating.')
+                rotated_recently = True
+        else:
+            rotated_recently = False
         print('Starting Upload')
         params = []
         uploading = os.path.exists('library-temp-index-1')
