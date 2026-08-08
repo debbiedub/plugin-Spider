@@ -50,65 +50,58 @@ SHUTDOWN = object()
 
 
 class RunAllScripts(object):
+    """All scripts restarted.
+
+    The general pattern for such a restart method is:
+    while not SHUTDOWN:
+        sleep
+        with locks:
+            if not RUN:
+                continue
+            do one iteration.
+    """
 
     def __init__(self):
         self.state = RUN
 
+        # These are semaphores, one for each purpose
+        # This is also the order in which they shall always be aquired
+        # should the need ever arise to hold many of them at the same time
+        self.secondary_big_job = asyncio.Semaphore(1)
+        self.spider_cache = asyncio.Lock()
+
     async def restart_node(self) -> None:
         restarted = False
+        laps = 0
         while self.state is not SHUTDOWN:
+            await asyncio.sleep(1)
+            if self.state not in [RUN, RESTART]:
+                continue
+            if self.state is RESTART and not restarted:
+                await shell('restart', './run.sh stop')
+                await asyncio.sleep(10)
+                restarted = True
+            elif laps < 3 * 3600:
+                laps += 1
+                continue
+            laps = 0
             await shell('node', './run.sh start')
             if restarted:
+                print('Node restarted')
                 await asyncio.sleep(100)
                 self.state = RUN
-            for i in range(3 * 3600):
-                await asyncio.sleep(1)
-                if self.state is SHUTDOWN:
-                    break
-                if not restarted and self.state is RESTART:
-                    await shell('restart', './run.sh stop')
-                    await asyncio.sleep(10)
-                    restarted = True
-                    break
         print('No more restarts of node')
 
+    def allow_debugger_arg(self, port: int) -> str:
+        return '-agentlib:jdwp=' + ','.join(['transport=dt_socket',
+                                             'server=y',
+                                             'suspend=n',
+                                             f'address=127.0.0.1:{port}'])
+
     async def upload(self) -> None:
-        await asyncio.sleep(10)
         failed_attempts = 0
-        rotated_recently = False
         while self.state is not SHUTDOWN:
-            if datetime.datetime.now().day == 15:
-                if not rotated_recently:
-                    # Rotate every month on the 15th
-                    print('Start rotating.')
-                    DIR_NAME = 'library-spider-pushed-data-cache'
-                    OLD_DIR_NAME = f'{DIR_NAME}.old'
-                    if os.path.exists(OLD_DIR_NAME):
-                        counter = 1
-                        while os.path.exists(new_dir_name := f'library-spider-pushed-data-cache.old{counter}'):
-                            counter += 1
-                        print(f'Move {OLD_DIR_NAME} into {new_dir_name}')
-                        os.rename(OLD_DIR_NAME, new_dir_name)
-                    NEW_DIR_NAME = f'{DIR_NAME}.new'
-                    if os.path.exists(NEW_DIR_NAME):
-                        print(f'Remove the {NEW_DIR_NAME} that is in the way')
-                        for file in os.scandir(NEW_DIR_NAME):
-                            os.remove(file)
-                        os.rmdir(NEW_DIR_NAME)
-                    await shell('rotate',
-                                f'cd {DIR_NAME} && ' +
-                                'java -cp ../../git/plugin-Library/dist/uploader.jar freenet.library.uploader.MoveUsedPartsOfIndex `cat ../library.index.lastpushed.chk`')
-                    print(f'Rename {DIR_NAME}, {OLD_DIR_NAME}')
-                    os.rename(DIR_NAME, OLD_DIR_NAME)
-                    print(f'Rename {NEW_DIR_NAME}, {DIR_NAME}')
-                    os.rename(NEW_DIR_NAME, DIR_NAME)
-                    await shell('calculate size',
-                                f'( du {DIR_NAME}; ls {DIR_NAME} | wc -l ) > {DIR_NAME}.size')
-                    print('Done rotating.')
-                    rotated_recently = True
-            else:
-                rotated_recently = False
-            print('Starting Upload')
+            await asyncio.sleep(10)
             params = []
             uploading = os.path.exists('library-temp-index-1')
             if self.state is START_SHUTDOWN:
@@ -116,10 +109,13 @@ class RunAllScripts(object):
                 params.append("--force-create-usk")
                 if uploading:
                     self.state = SHUTDOWN
-            await shell('upload',
-                        'exec nice java ' +
-                        '-jar ../git/plugin-Library/dist/uploader.jar ' +
-                        f'{" ".join(params)}')
+            async with self.spider_cache:
+                print('Starting Upload')
+                await shell('upload',
+                            'exec nice java ' +
+                            self.allow_debugger_arg(5005) + ' ' +
+                            '-jar ../git/plugin-Library/dist/uploader.jar ' +
+                            f'{" ".join(params)}')
             upload_not_completed = os.path.exists('library-temp-index-1')
             if uploading:
                 if upload_not_completed:
@@ -135,30 +131,92 @@ class RunAllScripts(object):
                 else:
                     failed_attempts //= 2
             if upload_not_completed:
-                await asyncio.sleep(10)
+                pass
             else:
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
         print('No more uploads started')
 
+    async def rotate(self) -> None:
+        """Rotate every month on the 15th."""
+        rotated_recently = False
+        while self.state is not SHUTDOWN:
+            await asyncio.sleep(40)
+            if not datetime.datetime.now().day == 15:
+                rotated_recently = False
+                continue
+            if rotated_recently:
+                continue
+            async with self.spider_cache:
+                if self.state is not RUN:
+                    continue
+                print('Start rotating.')
+                DIR_NAME = 'library-spider-pushed-data-cache'
+                OLD_DIR_NAME = f'{DIR_NAME}.old'
+                if os.path.exists(OLD_DIR_NAME):
+                    counter = 1
+                    while os.path.exists(
+                            new_dir_name := f'{OLD_DIR_NAME}{counter}'):
+                        counter += 1
+                    print(f'Move {OLD_DIR_NAME} into {new_dir_name}')
+                    os.rename(OLD_DIR_NAME, new_dir_name)
+                NEW_DIR_NAME = f'{DIR_NAME}.new'
+                if os.path.exists(NEW_DIR_NAME):
+                    print(f'Remove the {NEW_DIR_NAME} that is in the way')
+                    for file in os.scandir(NEW_DIR_NAME):
+                        os.remove(file)
+                    os.rmdir(NEW_DIR_NAME)
+                await shell(
+                    'rotate',
+                    f'cd {DIR_NAME} && ' +
+                    'java ' +
+                    self.allow_debugger_arg(5006) + ' ' +
+                    '-cp ../../git/plugin-Library/dist/uploader.jar' +
+                    ' freenet.library.uploader.MoveUsedPartsOfIndex' +
+                    ' `cat ../library.index.lastpushed.chk`')
+                print(f'Rename {DIR_NAME}, {OLD_DIR_NAME}')
+                os.rename(DIR_NAME, OLD_DIR_NAME)
+                print(f'Rename {NEW_DIR_NAME}, {DIR_NAME}')
+                os.rename(NEW_DIR_NAME, DIR_NAME)
+            await shell('calculate size',
+                        f'( du {DIR_NAME}; ls {DIR_NAME} | wc -l )' +
+                        f' > {DIR_NAME}.size')
+            print('Done rotating.')
+            rotated_recently = True
+        print('No more rotate started.')
+
     async def download(self) -> None:
-        await asyncio.sleep(30)
-        while self.state is RUN:
-            print('Starting DownloadOneEdition')
-            pubkey = open('library.index.pubkey').read()
-            assert pubkey.startswith('freenet:SSK')
-            pubkey = 'USK' + pubkey[11:] + '/0/'
-            cwd = os.getcwd()
-            params = [
-                'freenet.library.uploader.DownloadOneEdition',
-                '5',
-                pubkey,
-                f'{cwd}/library-spider-pushed-data-cache',
-            ]
-            await shell('download',
-                        'exec nice -18 java ' +
-                        '-cp ../git/plugin-Library/dist/uploader.jar ' +
-                        f'{" ".join(params)}')
-            if self.state is RUN:
+        while self.state is not SHUTDOWN:
+            await asyncio.sleep(30)
+            async with self.secondary_big_job:
+                if self.state is not RUN:
+                    continue
+                print('Starting DownloadOneEdition')
+                pubkey = open('library.index.pubkey').read()
+                assert pubkey.startswith('freenet:SSK')
+                pubkey = 'USK' + pubkey[11:] + '/0/'
+                cwd = os.getcwd()
+                params = [
+                    'freenet.library.uploader.DownloadOneEdition',
+                    '5',
+                    pubkey,
+                    f'{cwd}/library-spider-pushed-data-cache',
+                ]
+
+                if self.state is SHUTDOWN:
+                    break
+                await shell('download',
+                            'exec nice -18 java ' +
+                            self.allow_debugger_arg(5007) + ' ' +
+                            '-cp ../git/plugin-Library/dist/uploader.jar ' +
+                            f'{" ".join(params)}')
+        print('No more downloads started')
+
+    async def deletions(self) -> None:
+        while self.state is not SHUTDOWN:
+            await asyncio.sleep(50)
+            async with self.secondary_big_job:
+                if self.state is not RUN:
+                    continue
                 # Check if there are deletions left in the processed files
                 async with asyncio.TaskGroup() as tg:
                     print('Checking for deletions left')
@@ -170,21 +228,20 @@ class RunAllScripts(object):
                     task_communicate = tg.create_task(proc.communicate())
                 out, err = task_communicate.result()
                 if err:
-                    print('Checked for deletions stderr:', err, file=sys.stderr)
+                    print('Checked for deletions stderr:', err,
+                          file=sys.stderr)
                     break
                 if not out.decode().strip():
                     print('No deletions queued')
-                    await shell('deletions',
-                                'exec nice -20 java' +
-                                '-jar ../git/plugin-Library/dist/uploader.jar ' +
-                                '--scan-for-deletions')
+                    await shell(
+                        'deletions',
+                        'exec nice -20 java ' +
+                        self.allow_debugger_arg(5008) + ' ' +
+                        '-jar ../git/plugin-Library/dist/uploader.jar ' +
+                        '--scan-for-deletions')
                 else:
                     print('Deletions left')
-            for i in range(1000):
-                await asyncio.sleep(1)
-                if self.state is SHUTDOWN:
-                    break
-        print('No more downloads started')
+        print('No more deletions started')
 
     def state_controller_print_help(self) -> None:
         print('Running states are:')
@@ -221,7 +278,9 @@ class RunAllScripts(object):
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.restart_node())
             tg.create_task(self.upload())
+            tg.create_task(self.rotate())
             tg.create_task(self.download())
+            tg.create_task(self.deletions())
 
         input_task.cancel()
 
